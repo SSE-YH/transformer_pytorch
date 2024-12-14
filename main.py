@@ -6,6 +6,18 @@ import math
 import pandas as pd
 from torch.utils.data import Dataset, DataLoader
 from transformers import BertTokenizer
+from tqdm import tqdm
+
+src_vocab_size = 30522  # BERT tokenizer vocab size
+tgt_vocab_size = 30522  # BERT tokenizer vocab size
+d_model = 128  # Dimensionality of the embeddings
+num_heads = 16  # Number of attention heads
+d_ff = 256  # Dimensionality of the feed-forward layer
+num_layers = 4  # Number of encoder/decoder layers
+dropout = 0.1  # Dropout rate
+max_length = 50  # Maximum length of tokenized sequences
+batch_size = 128  # Batch size
+num_epochs = 20  # Number of epochs
 
 
 class PositionalEncoding(nn.Module):
@@ -90,10 +102,7 @@ class Transformer(nn.Module):
         # tgt_mask : decoder self-attn에서 미래 시점 단어를 못보게 하기 위해서
         # memory_mask : Encoder의 출력(memory)에 대해 특정 위치를 마스킹하기 위해
         memory = self.encoder(src, src_mask)
-
-        memory_mask = (src != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)
-
-        output = self.decoder(tgt, memory, tgt_mask, memory_mask)
+        output = self.decoder(tgt, memory, tgt_mask, None)
         return self.generator(output)
     
 
@@ -186,8 +195,11 @@ class TranslationDataset(Dataset):
         except Exception as e:
             raise ValueError(f"Failed to read data from {file_path}: {e}")
 
-        self.src_texts = data['eng'].tolist()
-        self.tgt_texts = data['kor'].tolist()
+        # self.src_texts = data['eng'].tolist()
+        # self.tgt_texts = data['kor'].tolist()
+        self.src_texts = [text for text in data['eng'] if isinstance(text, str) and text.strip()]
+        self.tgt_texts = [text for text in data['kor'] if isinstance(text, str) and text.strip()]
+
 
     def __len__(self):
         return len(self.src_texts)
@@ -211,17 +223,9 @@ def collate_fn(batch):
     return src_batch, tgt_batch
 
 # Main function
-if __name__ == "__main__":
-    src_vocab_size = 30522  # BERT tokenizer vocab size
-    tgt_vocab_size = 30522  # BERT tokenizer vocab size
-    d_model = 512  # Dimensionality of the embeddings
-    num_heads = 8  # Number of attention heads
-    d_ff = 2048  # Dimensionality of the feed-forward layer
-    num_layers = 6  # Number of encoder/decoder layers
-    dropout = 0.1  # Dropout rate
-    max_length = 50  # Maximum length of tokenized sequences
-    batch_size = 32  # Batch size
-    num_epochs = 10  # Number of epochs
+
+def train():
+
 
     tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
@@ -231,13 +235,14 @@ if __name__ == "__main__":
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_fn)
 
     # Initialize Transformer model
-    transformer = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, d_ff, num_layers, dropout).to(device)
-    optimizer = torch.optim.Adam(transformer.parameters(), lr=1e-4)
+    model = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, d_ff, num_layers, dropout).to(device)
+    model.load_state_dict(torch.load("weights_128_16_256_4_0.1_128_10.pth", map_location=device))
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
     criterion = nn.CrossEntropyLoss()
 
     # Training loop
-    for epoch in range(num_epochs):
-        transformer.train()
+    for epoch in tqdm(range(num_epochs)):
+        model.train()
         epoch_loss = 0
         total_tokens = 0
 
@@ -247,17 +252,17 @@ if __name__ == "__main__":
              # src_mask 생성
             src_mask = (src != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
 
-            # tgt_mask 생성
-            look_ahead_mask = subsequent_mask(tgt.size(1)).to(device)  # (seq_len, seq_len)
-            padding_mask = (tgt != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
-            tgt_mask = look_ahead_mask.unsqueeze(0).unsqueeze(1) & padding_mask  # (batch_size, num_heads, seq_len, seq_len)
-
-           # Separate target into input and output
+            # Separate target into input and output
             tgt_input = tgt[:, :-1]  # Decoder input
             tgt_output = tgt[:, 1:]  # Expected output
 
+            # tgt_mask 생성
+            look_ahead_mask = subsequent_mask(tgt_input.size(1)).to(device)  # (seq_len, seq_len)
+            padding_mask = (tgt_input != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            tgt_mask = look_ahead_mask.unsqueeze(0).unsqueeze(1) & padding_mask  # (batch_size, num_heads, seq_len, seq_len)
+
             # Model forward pass
-            output = transformer(src, tgt_input, src_mask, tgt_mask)
+            output = model(src, tgt_input, src_mask, tgt_mask)
 
             # Reshape outputs for loss calculation
             output = output.view(-1, tgt_vocab_size)
@@ -271,10 +276,70 @@ if __name__ == "__main__":
             # Track loss and token count
             epoch_loss += loss.item() * tgt_output.size(0)
             total_tokens += tgt_output.size(0)
+            # if batch_idx % 50 ==0: print(f'current batch : {batch_idx}')
 
         avg_loss = epoch_loss / total_tokens
         print(f"Epoch {epoch + 1}/{num_epochs}, Avg Loss: {avg_loss:.4f}")
 
+    model_name = f'weights_{d_model}_{num_heads}_{d_ff}_{num_layers}_{dropout}_{batch_size}_{num_epochs}.pth'
+    torch.save(model.state_dict(), model_name)
     print("Training complete.")
 
+def predict():
+    tokenizer = BertTokenizer.from_pretrained("bert-base-uncased")
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
+    model = Transformer(src_vocab_size, tgt_vocab_size, d_model, num_heads, d_ff, num_layers, dropout).to(device)
+
+    # Load trained weights
+    model.load_state_dict(torch.load("weights_128_16_256_4_0.1_128_10.pth", map_location=device))
+
+    # Input sentence
+    input_sentence = "How are you?"
+
+    model.eval()
+    
+    # Tokenize the input sentence
+    src_tokens = tokenizer(
+        input_sentence,
+        return_tensors='pt',
+        padding='max_length',
+        truncation=True,
+        max_length=max_length
+    )['input_ids'].to(device)  # Shape: [1, seq_len]
+    
+    # Source mask
+    src_mask = (src_tokens != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)  # Shape: [1, 1, 1, seq_len]
+
+    # Start token for the target
+    tgt_tokens = torch.tensor([tokenizer.cls_token_id], dtype=torch.long, device=device).unsqueeze(0)  # Shape: [1, 1]
+
+    # Decoding loop
+    for _ in range(max_length):
+        # Target mask
+        tgt_mask = torch.triu(torch.ones((tgt_tokens.size(1), tgt_tokens.size(1)), device=device), diagonal=1).bool()
+
+        # Forward pass through the model
+        output = model(src_tokens, tgt_tokens, src_mask, tgt_mask)
+
+        # Get the most probable next token
+        next_token = output[:, -1, :].argmax(dim=-1).unsqueeze(0)  # Shape: [1, 1]
+
+        # Append the next token to the target sequence
+        tgt_tokens = torch.cat([tgt_tokens, next_token], dim=1)
+
+        # Stop if the model generates the [SEP] token
+        if next_token.item() == tokenizer.sep_token_id:
+            break
+
+    # Decode the generated tokens into a sentence
+    translated_tokens = tgt_tokens.squeeze(0).tolist()
+    translated_sentence = tokenizer.decode(translated_tokens, skip_special_tokens=True)
+
+    print(f'input sentense : {input_sentence}')
+    print(f'translated sentense : {translated_sentence}')
+
+
+if __name__ == "__main__":
+    train()
+    # predict()
