@@ -26,42 +26,36 @@ class PositionalEncoding(nn.Module):
 class MultiHeadAttention(nn.Module):
     def __init__(self, d_model, num_heads):
         super(MultiHeadAttention, self).__init__()
-        assert d_model % num_heads ==0
+        assert d_model % num_heads == 0
         self.d_k = d_model // num_heads
         self.num_heads = num_heads
-        self.linears = nn.ModuleList([nn.Linear(d_model, d_model) for _ in range(4)]) 
-        self.attn = None
+        self.query_linear = nn.Linear(d_model, d_model)
+        self.key_linear = nn.Linear(d_model, d_model)
+        self.value_linear = nn.Linear(d_model, d_model)
+        self.output_linear = nn.Linear(d_model, d_model)
 
     def attention(self, query, key, value, mask=None):
-        # dot product
-        scores = torch.matmul(query, key.transpose(-2, -1))/math.sqrt(self.d_k)
-        # masking
+        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.d_k)
         if mask is not None:
             scores = scores.masked_fill(mask == 0, -1e9)
-        # softmax
         p_attn = F.softmax(scores, dim=-1)
-        # attn value
         out = torch.matmul(p_attn, value)
+        return out
 
-        return out, p_attn
-    
     def forward(self, query, key, value, mask=None):
-        batch_size= query.size(0)
+        batch_size = query.size(0)
+        query = self.query_linear(query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        key = self.key_linear(key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
+        value = self.value_linear(value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
 
-        query = self.linears[0](query).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        key = self.linears[0](key).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-        value = self.linears[0](value).view(batch_size, -1, self.num_heads, self.d_k).transpose(1, 2)
-
-        attn_output, self.attn = self.attention(query, key, value, mask)
+        attn_output = self.attention(query, key, value, mask)
 
         attn_output = attn_output.transpose(1, 2).contiguous().view(batch_size, -1, self.num_heads * self.d_k)
-        output = self.linears[3](attn_output)
-
-        return output
+        return self.output_linear(attn_output)
     
 
 class FeedForward(nn.Module):
-    def __init__(self, d_model, d_Ff, dropout=0.1):
+    def __init__(self, d_model, d_ff, dropout=0.1):
         super(FeedForward, self).__init__()
         self.input_layer = nn.Linear(d_model, d_ff)
         self.output_layer = nn.Linear(d_ff, d_model)
@@ -88,14 +82,18 @@ class Transformer(nn.Module):
         # dropout: Dropout rate
         super(Transformer, self).__init__()
         self.encoder = Encoder(src_vocab_size, d_model, num_heads, d_ff, num_layers, dropout)
-        self.dcoder = Decoder(tgt_vocab_size, d_model, num_heads, d_ff, num_layers, dropout)
+        self.decoder = Decoder(tgt_vocab_size, d_model, num_heads, d_ff, num_layers, dropout)
         self.generator = nn.Linear(d_model, tgt_vocab_size)
 
     def forward(self, src, tgt, src_mask, tgt_mask):
         # src_mask : decoder cross-attn에서 특정 위치 마스킹 목적 (패딩 토큰 등)
         # tgt_mask : decoder self-attn에서 미래 시점 단어를 못보게 하기 위해서
+        # memory_mask : Encoder의 출력(memory)에 대해 특정 위치를 마스킹하기 위해
         memory = self.encoder(src, src_mask)
-        output = self.decoder(tgt, memory, tgt_mask, None)
+
+        memory_mask = (src != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)
+
+        output = self.decoder(tgt, memory, tgt_mask, memory_mask)
         return self.generator(output)
     
 
@@ -149,6 +147,7 @@ class Decoder(nn.Module):
     def forward(self, tgt, memory, tgt_mask, memory_mask):
         x = self.embedding(tgt)
         x = self.positional_encoding(x)
+        # n_layers 수만큼 반복
         for layer in self.layers:
             x = layer(x, memory, tgt_mask, memory_mask)
         return x
@@ -245,8 +244,13 @@ if __name__ == "__main__":
         for batch_idx, (src, tgt) in enumerate(dataloader):
             optimizer.zero_grad()
 
-            src_mask = torch.ones(src.size(0), 1, src.size(1), dtype=torch.bool, device=device)
-            tgt_mask = subsequent_mask(tgt.size(1)).unsqueeze(0).repeat(tgt.size(0), 1, 1).to(device)
+             # src_mask 생성
+            src_mask = (src != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+
+            # tgt_mask 생성
+            look_ahead_mask = subsequent_mask(tgt.size(1)).to(device)  # (seq_len, seq_len)
+            padding_mask = (tgt != tokenizer.pad_token_id).unsqueeze(1).unsqueeze(2)  # (batch_size, 1, 1, seq_len)
+            tgt_mask = look_ahead_mask.unsqueeze(0).unsqueeze(1) & padding_mask  # (batch_size, num_heads, seq_len, seq_len)
 
            # Separate target into input and output
             tgt_input = tgt[:, :-1]  # Decoder input
